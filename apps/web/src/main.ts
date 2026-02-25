@@ -18,7 +18,7 @@ app.innerHTML = `
     .status { font-size: 13px; color: #536079; }
     .viewer { position: relative; width: min(100%, 420px); aspect-ratio: 9/19.5; border-radius: 16px; overflow: hidden; background: #111; margin-top: 12px; }
     img { width: 100%; height: 100%; object-fit: contain; display: block; }
-    .overlay { position: absolute; inset: 0; }
+    .overlay { position: absolute; inset: 0; touch-action: none; }
   </style>
   <div class="panel">
     <div class="row">
@@ -63,6 +63,10 @@ tokenInput.value = params.get("token") ?? "";
 let ws: WebSocket | null = null;
 let ownPeerId = "";
 let lockOwnerPeerId: string | null = null;
+let lastFrameUrl: string | null = null;
+let pendingFrameBlob: Blob | null = null;
+let frameRenderQueued = false;
+let lastPointerMoveSentAt = 0;
 
 const helloAckSchema = z.object({
   t: z.literal("hello_ack"),
@@ -70,13 +74,6 @@ const helloAckSchema = z.object({
   role: z.string(),
   sessionId: z.string(),
   emulatorId: z.string(),
-});
-
-const frameSchema = z.object({
-  t: z.literal("frame"),
-  mime: z.string(),
-  dataBase64: z.string(),
-  ts: z.number(),
 });
 
 const sessionStateSchema = z.object({
@@ -128,19 +125,43 @@ const sendPointer = (action: "down" | "move" | "up", event: PointerEvent): void 
 };
 
 overlay.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
   overlay.setPointerCapture(event.pointerId);
   sendPointer("down", event);
 });
 
 overlay.addEventListener("pointermove", (event) => {
-  if (event.pressure > 0) {
+  if ((event.buttons & 1) === 1) {
+    const now = performance.now();
+    if (now - lastPointerMoveSentAt < 16) {
+      return;
+    }
+    lastPointerMoveSentAt = now;
     sendPointer("move", event);
   }
 });
 
 overlay.addEventListener("pointerup", (event) => {
+  event.preventDefault();
   sendPointer("up", event);
 });
+
+const queueFrameRender = (): void => {
+  if (frameRenderQueued) return;
+  frameRenderQueued = true;
+  requestAnimationFrame(() => {
+    frameRenderQueued = false;
+    if (!pendingFrameBlob) return;
+
+    const nextFrameUrl = URL.createObjectURL(pendingFrameBlob);
+    pendingFrameBlob = null;
+    frameImg.src = nextFrameUrl;
+    if (lastFrameUrl) {
+      URL.revokeObjectURL(lastFrameUrl);
+    }
+    lastFrameUrl = nextFrameUrl;
+  });
+};
 
 window.addEventListener("keydown", (event) => {
   if (event.repeat) return;
@@ -150,6 +171,7 @@ window.addEventListener("keydown", (event) => {
       type: "key",
       action: "down",
       keyCode: event.keyCode,
+      key: event.key,
     },
   });
 });
@@ -177,13 +199,27 @@ const connect = (): void => {
     statusText.textContent = "Disconnected";
     ownPeerId = "";
     lockOwnerPeerId = null;
+    if (lastFrameUrl) {
+      URL.revokeObjectURL(lastFrameUrl);
+      lastFrameUrl = null;
+    }
     setLockStatus();
   });
 
   ws.addEventListener("message", (raw) => {
+    if (raw.data instanceof Blob) {
+      pendingFrameBlob = raw.data;
+      queueFrameRender();
+      return;
+    }
+
+    if (typeof raw.data !== "string") {
+      return;
+    }
+
     let message: unknown;
     try {
-      message = JSON.parse(raw.data as string);
+      message = JSON.parse(raw.data);
     } catch {
       return;
     }
@@ -194,12 +230,6 @@ const connect = (): void => {
       sessionInput.value = helloAck.data.sessionId;
       statusText.textContent = `Connected to ${helloAck.data.emulatorId} as ${helloAck.data.role}`;
       setLockStatus();
-      return;
-    }
-
-    const frame = frameSchema.safeParse(message);
-    if (frame.success) {
-      frameImg.src = `data:${frame.data.mime};base64,${frame.data.dataBase64}`;
       return;
     }
 

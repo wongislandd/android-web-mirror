@@ -32,6 +32,7 @@ const PORT = Number(process.env.PORT ?? 8787);
 const WEB_ORIGIN = process.env.WEB_ORIGIN ?? "http://localhost:5173";
 const SESSION_SIGNING_KEY = process.env.SESSION_SIGNING_KEY ?? "dev-only-secret";
 const SESSION_DEFAULT_TTL_SEC = Number(process.env.SESSION_DEFAULT_TTL_SEC ?? 3600);
+const MAX_WS_BUFFERED_BYTES = Number(process.env.MAX_WS_BUFFERED_BYTES ?? 2_000_000);
 
 const sessions = new Map<string, Session>();
 
@@ -133,17 +134,8 @@ const lockSchema = z.object({
   action: z.enum(["request", "release"]),
 });
 
-const frameSchema = z.object({
-  t: z.literal("frame"),
-  mime: z.string(),
-  width: z.number().int().positive().optional(),
-  height: z.number().int().positive().optional(),
-  dataBase64: z.string(),
-  ts: z.number().int(),
-});
-
 const sendJson = (ws: WebSocket, payload: unknown): void => {
-  if (ws.readyState === ws.OPEN) {
+  if (ws.readyState === ws.OPEN && ws.bufferedAmount <= MAX_WS_BUFFERED_BYTES) {
     ws.send(JSON.stringify(payload));
   }
 };
@@ -183,11 +175,39 @@ const relayByRole = (session: Session, role: Role, payload: unknown): void => {
   }
 };
 
+const relayBinaryByRole = (session: Session, role: Role, payload: Buffer): void => {
+  for (const peer of session.peers.values()) {
+    if (peer.role === role && peer.ws.readyState === peer.ws.OPEN && peer.ws.bufferedAmount <= MAX_WS_BUFFERED_BYTES) {
+      peer.ws.send(payload, { binary: true });
+    }
+  }
+};
+
 wss.on("connection", (ws) => {
   let peer: Peer | null = null;
   let sessionId = "";
 
-  ws.on("message", (rawMessage) => {
+  ws.on("message", (rawMessage, isBinary) => {
+    if (isBinary) {
+      if (!peer) {
+        sendJson(ws, { t: "error", message: "Auth required before binary messages" });
+        return;
+      }
+
+      const session = findSession(sessionId);
+      if (!session) {
+        ws.close(4004, "Session not found");
+        return;
+      }
+
+      if (peer.role === "agent") {
+        const frameBuffer = Buffer.from(rawMessage as Buffer);
+        relayBinaryByRole(session, "controller", frameBuffer);
+        relayBinaryByRole(session, "viewer", frameBuffer);
+      }
+      return;
+    }
+
     let message: unknown;
     try {
       message = JSON.parse(rawMessage.toString());
@@ -258,13 +278,6 @@ wss.on("connection", (ws) => {
       } else {
         relayByRole(session, "agent", { t: signal.data.t, payload: signal.data.payload });
       }
-      return;
-    }
-
-    const frame = frameSchema.safeParse(message);
-    if (frame.success && peer.role === "agent") {
-      relayByRole(session, "controller", frame.data);
-      relayByRole(session, "viewer", frame.data);
       return;
     }
 
