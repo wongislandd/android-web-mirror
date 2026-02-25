@@ -1,0 +1,14 @@
+{
+  "name": "android-browser-mirror-poc",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:signaling": "npm --workspace @poc/signaling run dev",
+    "dev:agent": "npm --workspace @poc/agent run dev",
+    "dev:web": "npm --workspace @poc/web run dev",
+    "build": "npm run -ws build"
+  }
+}
